@@ -12,7 +12,9 @@ use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 use txwatch_config::{AppConfig, WebhookDestination, WebhookFormat, WebhookHeaders, REDACTED};
-use txwatch_notifier::{build_client, send_to_destination_simple, test_payload_with_network};
+use txwatch_notifier::{
+    build_client, destination_client, send_to_destination_simple, test_payload_with_network,
+};
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -64,6 +66,15 @@ enum LogFormat {
 enum OutputFormat {
     Text,
     Json,
+}
+
+/// How `validate --check-webhooks` probes each destination.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum WebhookCheckMode {
+    /// HEAD request, falling back to OPTIONS on 405/501
+    Head,
+    /// Send a real `test: true` payload through the destination client
+    Post,
 }
 
 /// Network names accepted by `test-webhook --network`. `public` and `pubnet`
@@ -118,9 +129,17 @@ enum Command {
     ///
     /// Exit codes: 0 = valid config, 1 = invalid or missing config
     Validate {
-        /// Send a HEAD/OPTIONS request to each webhook URL and warn on unreachable endpoints.
-        #[arg(long)]
-        check_webhooks: bool,
+        /// Probe each webhook URL. `head` (default) sends HEAD/OPTIONS; `post`
+        /// sends a real `test: true` payload through the configured destination
+        /// client (mTLS, custom headers, secrets).
+        #[arg(
+            long,
+            value_enum,
+            num_args = 0..=1,
+            default_missing_value = "head",
+            value_name = "MODE"
+        )]
+        check_webhooks: Option<WebhookCheckMode>,
 
         /// Verify that each contract exists on its configured Horizon network.
         #[arg(long)]
@@ -166,13 +185,21 @@ enum Command {
         #[arg(long)]
         secret: Option<String>,
 
-        /// Body format for --url: txwatch, slack, discord or pagerduty
+        /// Body format for --url (see `txwatch test-webhook --help` for choices)
         #[arg(long, value_parser = parse_webhook_format, default_value = "txwatch")]
         format: WebhookFormat,
 
         /// PagerDuty routing key for --url with --format pagerduty
         #[arg(long)]
         routing_key: Option<String>,
+
+        /// Template body for --url with --format template
+        #[arg(long, conflicts_with = "template_file")]
+        template: Option<String>,
+
+        /// File containing the template body for --url with --format template
+        #[arg(long, conflicts_with = "template")]
+        template_file: Option<PathBuf>,
 
         /// Extra header for --url as "Name: value"; repeatable
         #[arg(long = "header", value_name = "NAME: VALUE")]
@@ -325,49 +352,51 @@ async fn main() -> Result<()> {
             let mut summary = config_summary_json(&cfg);
 
             // Optionally run webhook checks and embed results.
-            if check_webhooks {
+            if let Some(mode) = check_webhooks {
                 let client = Client::builder()
                     .timeout(Duration::from_secs(5))
                     .build()
                     .context("failed to build HTTP client")?;
-                let targets: Vec<(String, String)> = cfg
+                let targets: Vec<(String, WebhookDestination)> = cfg
                     .contracts
                     .iter()
                     .flat_map(|c| {
                         c.destinations()
                             .into_iter()
-                            .map(move |d| (c.label.clone(), d.url))
+                            .map(move |d| (c.label.clone(), d))
                     })
                     .collect();
-                let results = join_all(targets.into_iter().map(|(label, url)| {
+                let results = join_all(targets.into_iter().map(|(label, destination)| {
                     let client = &client;
                     async move {
-                        let result = check_webhook_reachable(client, &url).await;
-                        (label, url, result)
+                        let result = check_webhook(client, &destination, mode).await;
+                        (label, destination.url, result)
                     }
                 }))
                 .await;
                 let mut webhook_checks = Vec::new();
                 let mut any_failed = false;
                 for (label, url, result) in results {
-                    let (ok, status, error) = match result {
-                        Ok(s) => {
-                            let failed = s == "method not allowed";
-                            if failed {
-                                any_failed = true;
-                            }
-                            (true, s.to_owned(), None)
-                        }
-                        Err(e) => {
-                            any_failed = true;
-                            (false, "unreachable".to_owned(), Some(format!("{:#}", e)))
-                        }
+                    let (check, error) = match result {
+                        Ok(check) => (check, None),
+                        Err(e) => (
+                            WebhookCheck {
+                                reachable: false,
+                                status: None,
+                                ok: false,
+                            },
+                            Some(format!("{:#}", e)),
+                        ),
                     };
+                    if !check.ok {
+                        any_failed = true;
+                    }
                     let mut entry = serde_json::json!({
                         "contract": label,
                         "url": url,
-                        "ok": ok,
-                        "status": status,
+                        "ok": check.ok,
+                        "reachable": check.reachable,
+                        "status": check.status,
                     });
                     if let Some(err) = error {
                         entry["error"] = serde_json::Value::from(err);
@@ -402,6 +431,8 @@ async fn main() -> Result<()> {
                             any_failed = true;
                         }
                         serde_json::json!({
+                            "contract": check.contract,
+                            "contract_id": check.contract_id,
                             "network": check.network,
                             "status": check.status,
                             "latest_ledger": check.latest_ledger,
@@ -467,25 +498,25 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if check_webhooks {
+            if let Some(mode) = check_webhooks {
                 let client = Client::builder()
                     .timeout(Duration::from_secs(5))
                     .build()
                     .context("failed to build HTTP client")?;
-                let targets: Vec<(String, String)> = cfg
+                let targets: Vec<(String, WebhookDestination)> = cfg
                     .contracts
                     .iter()
                     .flat_map(|c| {
                         c.destinations()
                             .into_iter()
-                            .map(move |d| (c.label.clone(), d.url))
+                            .map(move |d| (c.label.clone(), d))
                     })
                     .collect();
-                let checks = join_all(targets.into_iter().map(|(label, url)| {
+                let checks = join_all(targets.into_iter().map(|(label, destination)| {
                     let client = &client;
                     async move {
-                        let result = check_webhook_reachable(client, &url).await;
-                        (label, url, result)
+                        let result = check_webhook(client, &destination, mode).await;
+                        (label, destination.url, result)
                     }
                 }))
                 .await;
@@ -493,13 +524,16 @@ async fn main() -> Result<()> {
                 println!("Webhook checks:");
                 for (label, url, result) in checks {
                     match result {
-                        Ok(status) => {
-                            // Any "HTTP NNN" result means a non-success, non-auth response — treat as failure.
-                            let is_failure = status.starts_with("HTTP ");
-                            if is_failure {
+                        Ok(check) => {
+                            if !check.ok {
                                 failed = true;
                             }
-                            println!("  {:<18} {:<20} {}", label, status, url)
+                            println!(
+                                "  {:<18} {:<20} {}",
+                                label,
+                                describe_webhook_check(&check),
+                                url
+                            )
                         }
                         Err(error) => {
                             failed = true;
@@ -526,7 +560,8 @@ async fn main() -> Result<()> {
                 println!("Horizon checks:");
                 for check in checks {
                     println!(
-                        "  {:<10} {:<20} latest ledger: {} — {}",
+                        "  {:<18} {:<10} {:<20} latest ledger: {} — {}",
+                        check.contract,
                         check.network,
                         check.status,
                         check
@@ -552,6 +587,8 @@ async fn main() -> Result<()> {
             secret,
             format,
             routing_key,
+            template,
+            template_file,
             headers,
         } => {
             let configured = contract
@@ -579,6 +616,18 @@ async fn main() -> Result<()> {
                 let explorer = explorer_url
                     .clone()
                     .or_else(|| selected.explorer_base_url().map(str::to_string));
+                let template_body = match (template, template_file) {
+                    (Some(body), _) => Some(body),
+                    (None, Some(path)) => Some(fs::read_to_string(&path).with_context(|| {
+                        format!("failed to read template file '{}'", path.display())
+                    })?),
+                    (None, None) => None,
+                };
+                if format == WebhookFormat::Template && template_body.is_none() {
+                    anyhow::bail!(
+                        "--format template requires --template or --template-file to provide the body"
+                    );
+                }
                 let destination = WebhookDestination {
                     url: url.ok_or_else(|| {
                         anyhow::anyhow!("--url is required unless --contract is provided")
@@ -587,6 +636,7 @@ async fn main() -> Result<()> {
                     format,
                     headers: parse_headers(&headers)?,
                     routing_key,
+                    template: template_body,
                     ..Default::default()
                 };
                 destination.validate()?;
@@ -1584,11 +1634,28 @@ fn destination_summary_json(destination: &WebhookDestination) -> serde_json::Val
     })
 }
 
+/// Every `WebhookFormat` variant name, in declaration order, for help and
+/// error messages.
+fn webhook_format_names() -> Vec<&'static str> {
+    [
+        WebhookFormat::Txwatch,
+        WebhookFormat::Slack,
+        WebhookFormat::Discord,
+        WebhookFormat::PagerDuty,
+        WebhookFormat::Teams,
+        WebhookFormat::Template,
+    ]
+    .into_iter()
+    .map(WebhookFormat::as_str)
+    .collect()
+}
+
 fn parse_webhook_format(value: &str) -> Result<WebhookFormat, String> {
     serde_json::from_value(serde_json::Value::from(value)).map_err(|_| {
         format!(
-            "unknown format '{}': use txwatch, slack, discord, pagerduty or template",
-            value
+            "unknown format '{}': use {}",
+            value,
+            webhook_format_names().join(", ")
         )
     })
 }
@@ -1641,37 +1708,73 @@ fn parse_headers(raw: &[String]) -> Result<WebhookHeaders> {
     Ok(headers)
 }
 
-async fn check_webhook_reachable(client: &Client, url: &str) -> Result<String> {
-    let response = client.head(url).send().await;
-    match response {
-        Ok(resp) if resp.status().is_success() => Ok("reachable".into()),
-        Ok(resp)
-            if resp.status() == StatusCode::UNAUTHORIZED
-                || resp.status() == StatusCode::FORBIDDEN =>
-        {
-            Ok("reachable (auth required)".into())
+/// Outcome of probing one webhook destination. `ok` is the single source of
+/// truth for pass/fail in both text and JSON output.
+#[derive(serde::Serialize)]
+struct WebhookCheck {
+    reachable: bool,
+    status: Option<u16>,
+    ok: bool,
+}
+
+impl WebhookCheck {
+    /// A 2xx/3xx response, or 401/403 (reachable but auth required), passes.
+    fn from_status(status: StatusCode) -> Self {
+        let ok = status.is_success()
+            || status.is_redirection()
+            || status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::FORBIDDEN;
+        Self {
+            reachable: true,
+            status: Some(status.as_u16()),
+            ok,
         }
-        Ok(resp)
-            if resp.status() == StatusCode::METHOD_NOT_ALLOWED
-                || resp.status() == StatusCode::NOT_IMPLEMENTED =>
-        {
-            let options = client.request(reqwest::Method::OPTIONS, url).send().await?;
-            if options.status().is_success() {
-                Ok("reachable (OPTIONS)".into())
-            } else if options.status() == StatusCode::UNAUTHORIZED
-                || options.status() == StatusCode::FORBIDDEN
-            {
-                Ok("reachable (auth required)".into())
-            } else {
-                Ok(format!("HTTP {}", options.status().as_u16()))
-            }
-        }
-        Ok(resp) => Ok(format!("HTTP {}", resp.status().as_u16())),
-        Err(err) => Err(err.into()),
     }
 }
 
+fn describe_webhook_check(check: &WebhookCheck) -> String {
+    match check.status {
+        Some(401) | Some(403) => "reachable (auth required)".to_owned(),
+        Some(code) if check.ok => format!("reachable (HTTP {})", code),
+        Some(code) => format!("HTTP {}", code),
+        None => "unreachable".to_owned(),
+    }
+}
+
+/// Probe one destination using its own configured client (mTLS, custom
+/// headers, secrets) so the check reflects what the notifier will actually do.
+async fn check_webhook(
+    client: &Client,
+    destination: &WebhookDestination,
+    mode: WebhookCheckMode,
+) -> Result<WebhookCheck> {
+    let probe = destination_client(client, destination)?;
+    if mode == WebhookCheckMode::Post {
+        let payload = serde_json::json!({ "test": true });
+        let result = send_to_destination_simple(&probe, destination, &payload).await?;
+        return Ok(WebhookCheck::from_status(result.final_status));
+    }
+
+    let mut request = probe.head(&destination.url);
+    for (name, value) in destination.headers.iter() {
+        request = request.header(name, value);
+    }
+    let resp = request.send().await?;
+    let status = resp.status();
+    if status == StatusCode::METHOD_NOT_ALLOWED || status == StatusCode::NOT_IMPLEMENTED {
+        let mut options = probe.request(reqwest::Method::OPTIONS, &destination.url);
+        for (name, value) in destination.headers.iter() {
+            options = options.header(name, value);
+        }
+        let options = options.send().await?;
+        return Ok(WebhookCheck::from_status(options.status()));
+    }
+    Ok(WebhookCheck::from_status(status))
+}
+
 struct HorizonCheck {
+    contract: String,
+    contract_id: String,
     network: String,
     status: &'static str,
     latest_ledger: Option<u64>,
@@ -1708,6 +1811,8 @@ async fn check_horizon_contract(
     };
     if !reachable {
         return HorizonCheck {
+            contract: contract.label.clone(),
+            contract_id: contract.contract_id.clone(),
             network: contract.network.as_str().into(),
             status: "unreachable",
             latest_ledger,
@@ -1723,6 +1828,8 @@ async fn check_horizon_contract(
         (Some(expected), Some(actual)) => {
             if expected != actual {
                 return HorizonCheck {
+                    contract: contract.label.clone(),
+                    contract_id: contract.contract_id.clone(),
                     network: contract.network.as_str().into(),
                     status: "passphrase mismatch",
                     latest_ledger,
@@ -1754,6 +1861,8 @@ async fn check_horizon_contract(
         .map(|response| response.status().is_success())
         .unwrap_or(false);
     HorizonCheck {
+        contract: contract.label.clone(),
+        contract_id: contract.contract_id.clone(),
         network: contract.network.as_str().into(),
         status: if found { "found" } else { "not found" },
         latest_ledger,
