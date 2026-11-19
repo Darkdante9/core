@@ -151,7 +151,7 @@ enum Command {
         network: NetworkArg,
 
         /// Horizon base URL for a custom network in the test payload
-        #[arg(long, value_parser = parse_horizon_url)]
+        #[arg(long, value_parser = parse_horizon_url, conflicts_with = "contract")]
         horizon_url: Option<String>,
 
         /// Explorer base URL for a custom network in the test payload
@@ -167,23 +167,32 @@ enum Command {
         secret: Option<String>,
 
         /// Body format for --url: txwatch, slack, discord or pagerduty
-        #[arg(long, value_parser = parse_webhook_format, default_value = "txwatch")]
+        #[arg(
+            long,
+            value_parser = parse_webhook_format,
+            default_value = "txwatch",
+            conflicts_with = "contract"
+        )]
         format: WebhookFormat,
 
         /// PagerDuty routing key for --url with --format pagerduty
-        #[arg(long)]
+        #[arg(long, conflicts_with = "contract")]
         routing_key: Option<String>,
 
         /// Extra header for --url as "Name: value"; repeatable
-        #[arg(long = "header", value_name = "NAME: VALUE")]
+        #[arg(long = "header", value_name = "NAME: VALUE", conflicts_with = "contract")]
         headers: Vec<String>,
     },
 
-    /// Print the JSON Schema for the config file or the alert webhook payload
+    /// Print the JSON Schema for the config file, the alert webhook payload or the batch body
     Schema {
         /// Print the schema for the alert webhook payload instead of the config
-        #[arg(long)]
+        #[arg(long, conflicts_with = "batch")]
         payload: bool,
+
+        /// Print the schema for the batched webhook body ({"alerts": [...]})
+        #[arg(long, conflicts_with = "payload")]
+        batch: bool,
     },
 
     /// Print a shell completion script, e.g. `txwatch completions bash > /etc/bash_completion.d/txwatch`
@@ -926,8 +935,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Schema { payload } => {
-            if payload {
+        Command::Schema { payload, batch } => {
+            if batch {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&schemars::schema_for!(txwatch_rules::AlertBatch))?
+                );
+            } else if payload {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&schemars::schema_for!(txwatch_rules::AlertPayload))?
@@ -1304,43 +1318,137 @@ fn spawn_reload_on_sighup(
     Ok(())
 }
 
+/// Default polling interval for the config watcher when notifications are
+/// unavailable or explicitly disabled. Kept well above the old 250 ms so an
+/// idle process does not constantly re-read and re-hash the config (#480).
+const DEFAULT_CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Resolve the polling interval from `TXWATCH_CONFIG_POLL_INTERVAL_MS`,
+/// clamped to at least 2 s so a misconfiguration cannot reintroduce the
+/// constant disk activity this watcher is meant to avoid.
+fn config_poll_interval() -> Duration {
+    std::env::var("TXWATCH_CONFIG_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .map(|d| d.max(DEFAULT_CONFIG_POLL_INTERVAL))
+        .unwrap_or(DEFAULT_CONFIG_POLL_INTERVAL)
+}
+
+/// Whether to use filesystem notifications. Set
+/// `TXWATCH_CONFIG_WATCH_POLL=1` to force polling (e.g. on network mounts
+/// where inotify is unreliable).
+fn config_watch_use_polling() -> bool {
+    matches!(
+        std::env::var("TXWATCH_CONFIG_WATCH_POLL").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// `(mtime, size)` for a file, used to skip re-hashing unchanged files.
+fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 /// Watches the configuration file and any included files for changes.
-/// Debounces changes to prevent partial reads and correctly detects
-/// symlink swaps (common in Kubernetes ConfigMap volume mounts).
+///
+/// Uses the `notify` crate (inotify/kqueue/ReadDirectoryChangesW) by default so
+/// an idle process does no disk work. Polling is an opt-in fallback
+/// (`TXWATCH_CONFIG_WATCH_POLL=1`) whose interval is configurable via
+/// `TXWATCH_CONFIG_POLL_INTERVAL_MS` (default 2 s). In both modes each file's
+/// `(mtime, size)` is cached so unchanged files are never re-read or re-hashed.
 fn spawn_config_watcher(
     path: PathBuf,
     reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
     horizon_url: Option<String>,
 ) {
     tokio::spawn(async move {
-        let mut last_hash = txwatch_config::compute_config_hash(&path).ok();
-        let poll_interval = Duration::from_millis(250);
+        let use_polling = config_watch_use_polling();
+        let poll_interval = config_poll_interval();
         let debounce_interval = Duration::from_millis(250);
 
-        loop {
-            tokio::time::sleep(poll_interval).await;
+        // Cache of (mtime, size) per watched file so we only re-hash on change.
+        let mut stamps: std::collections::HashMap<PathBuf, Option<(std::time::SystemTime, u64)>> =
+            std::collections::HashMap::new();
+        let mut last_hash = txwatch_config::compute_config_hash(&path).ok();
+        for file in watched_config_files(&path) {
+            stamps.insert(file.clone(), file_stamp(&file));
+        }
+
+        // Notification channel: `notify` events are forwarded here. In polling
+        // mode a timer feeds the same channel so the reload logic is shared.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<()>(16);
+
+        let _watcher = if use_polling {
+            info!(
+                path = %path.display(),
+                interval_ms = poll_interval.as_millis() as u64,
+                "watching config by polling"
+            );
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(poll_interval).await;
+                    if tx.send(()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            None
+        } else {
+            match start_notify_watcher(&path, event_tx.clone()) {
+                Ok(watcher) => {
+                    info!(path = %path.display(), "watching config with filesystem notifications");
+                    Some(watcher)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        interval_ms = poll_interval.as_millis() as u64,
+                        "filesystem notifications unavailable — falling back to polling"
+                    );
+                    let tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(poll_interval).await;
+                            if tx.send(()).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    None
+                }
+            }
+        };
+
+        while event_rx.recv().await.is_some() {
+            // Debounce: coalesce bursts of events (editors write several times).
+            tokio::time::sleep(debounce_interval).await;
+            while event_rx.try_recv().is_ok() {}
+
+            // Skip re-hashing entirely when no watched file's stamp changed.
+            let files = watched_config_files(&path);
+            let mut changed = false;
+            for file in &files {
+                let stamp = file_stamp(file);
+                if stamps.get(file) != Some(&stamp) {
+                    stamps.insert(file.clone(), stamp);
+                    changed = true;
+                }
+            }
+            if !changed {
+                continue;
+            }
 
             let current_hash = match txwatch_config::compute_config_hash(&path) {
                 Ok(h) => h,
                 Err(_) => continue,
             };
-
             if last_hash.as_ref() == Some(&current_hash) {
                 continue;
             }
-
-            // Debounce: wait until hash is stable across debounce_interval
-            tokio::time::sleep(debounce_interval).await;
-            let debounced_hash = match txwatch_config::compute_config_hash(&path) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-
-            if debounced_hash != current_hash {
-                continue;
-            }
-
-            last_hash = Some(debounced_hash);
+            last_hash = Some(current_hash);
             info!(path = %path.display(), "config file change detected — reloading config");
 
             if let Some(cfg) = reload_config(&path, horizon_url.as_deref()) {
@@ -1348,8 +1456,53 @@ fn spawn_config_watcher(
                     break;
                 }
             }
+            // Includes may have changed; refresh the stamp cache.
+            for file in watched_config_files(&path) {
+                stamps.insert(file.clone(), file_stamp(&file));
+            }
         }
     });
+}
+
+/// The root config plus every file it includes, resolved from the parsed
+/// config. Falls back to just the root file if parsing fails.
+fn watched_config_files(path: &Path) -> Vec<PathBuf> {
+    let mut files = vec![path.to_path_buf()];
+    if let Ok(cfg) = AppConfig::from_file(path) {
+        for included in cfg.loaded_files() {
+            let included = PathBuf::from(included);
+            if !files.contains(&included) {
+                files.push(included);
+            }
+        }
+    }
+    files
+}
+
+/// Install a `notify` watcher on the config's parent directory (so atomic
+/// renames and symlink swaps are seen) and forward events to `event_tx`.
+fn start_notify_watcher(
+    path: &Path,
+    event_tx: tokio::sync::mpsc::Sender<()>,
+) -> Result<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok() {
+            // Non-blocking send; a full channel already means a reload is pending.
+            let _ = event_tx.try_send(());
+        }
+    })
+    .context("failed to create filesystem watcher")?;
+
+    // Watch the directory rather than the file so editors that write-then-rename
+    // (and Kubernetes ConfigMap symlink swaps) still produce events.
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let watch_root = dir.unwrap_or_else(|| Path::new("."));
+    watcher
+        .watch(watch_root, RecursiveMode::NonRecursive)
+        .with_context(|| format!("failed to watch '{}'", watch_root.display()))?;
+    Ok(watcher)
 }
 
 /// Re-read and validate the config file.
@@ -1492,13 +1645,31 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 .map(|entry| {
                     let mut obj = serde_json::to_value(&entry.rule)
                         .unwrap_or_else(|_| serde_json::json!({}));
-                    if let Some(cooldown) = entry.cooldown_seconds {
-                        if let Some(map) = obj.as_object_mut() {
-                            map.insert(
-                                "cooldown_seconds".to_string(),
-                                serde_json::json!(cooldown),
-                            );
-                        }
+                    if let Some(map) = obj.as_object_mut() {
+                        // #481: include every rule-level setting so the JSON
+                        // output can be used to audit what will actually run.
+                        map.insert("enabled".to_string(), serde_json::json!(entry.enabled));
+                        map.insert(
+                            "severity".to_string(),
+                            serde_json::to_value(entry.severity)
+                                .unwrap_or(serde_json::Value::Null),
+                        );
+                        map.insert(
+                            "cooldown_seconds".to_string(),
+                            serde_json::json!(entry.cooldown_seconds),
+                        );
+                        map.insert(
+                            "cooldown_summary".to_string(),
+                            serde_json::json!(entry.cooldown_summary),
+                        );
+                        map.insert(
+                            "webhook_url_set".to_string(),
+                            serde_json::json!(entry.webhook_url.is_some()),
+                        );
+                        map.insert(
+                            "webhook_secret_set".to_string(),
+                            serde_json::json!(entry.webhook_secret.is_some()),
+                        );
                     }
                     obj
                 })
@@ -1522,10 +1693,23 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
             })
         })
         .collect();
+    // #481: include every effective top-level setting and the loaded files.
+    let loaded_files: Vec<String> = cfg
+        .loaded_files()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     serde_json::json!({
         "valid": true,
         "poll_interval_seconds": cfg.poll_interval_seconds,
         "cursor_file": cfg.cursor_file,
+        "state_file": cfg.state_file,
+        "include": cfg.include,
+        "loaded_files": loaded_files,
+        "max_contracts": cfg.max_contracts,
+        "max_pages_per_cycle": cfg.max_pages_per_cycle,
+        "concurrency": cfg.concurrency,
+        "readiness_policy": cfg.readiness_policy,
         "contracts": contracts,
     })
 }
