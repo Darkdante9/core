@@ -323,6 +323,9 @@ async fn main() -> Result<()> {
                 }
             };
             let mut summary = config_summary_json(&cfg);
+            // #474: run every requested check, then print once and set the exit
+            // code, so a failing webhook check never suppresses horizon results.
+            let mut any_failed = false;
 
             // Optionally run webhook checks and embed results.
             if check_webhooks {
@@ -348,7 +351,6 @@ async fn main() -> Result<()> {
                 }))
                 .await;
                 let mut webhook_checks = Vec::new();
-                let mut any_failed = false;
                 for (label, url, result) in results {
                     let (ok, status, error) = match result {
                         Ok(s) => {
@@ -375,11 +377,6 @@ async fn main() -> Result<()> {
                     webhook_checks.push(entry);
                 }
                 summary["webhook_checks"] = serde_json::Value::from(webhook_checks);
-                if any_failed {
-                    summary["valid"] = serde_json::Value::Bool(false);
-                    println!("{}", serde_json::to_string_pretty(&summary)?);
-                    std::process::exit(1);
-                }
             }
 
             // Optionally run Horizon checks and embed results.
@@ -394,11 +391,11 @@ async fn main() -> Result<()> {
                         .map(|c| check_horizon_contract(&client, c)),
                 )
                 .await;
-                let mut any_failed = false;
                 let horizon_checks: Vec<serde_json::Value> = checks
                     .into_iter()
                     .map(|check| {
-                        if !check.reachable || !check.found {
+                        // #473: share the pass/fail rule with the text output.
+                        if !check_passed(&check) {
                             any_failed = true;
                         }
                         serde_json::json!({
@@ -407,19 +404,21 @@ async fn main() -> Result<()> {
                             "latest_ledger": check.latest_ledger,
                             "reachable": check.reachable,
                             "found": check.found,
+                            "passphrase_ok": check.passphrase_ok,
                             "message": check.message,
                         })
                     })
                     .collect();
                 summary["horizon_checks"] = serde_json::Value::from(horizon_checks);
-                if any_failed {
-                    summary["valid"] = serde_json::Value::Bool(false);
-                    println!("{}", serde_json::to_string_pretty(&summary)?);
-                    std::process::exit(1);
-                }
             }
 
+            if any_failed {
+                summary["valid"] = serde_json::Value::Bool(false);
+            }
             println!("{}", serde_json::to_string_pretty(&summary)?);
+            if any_failed {
+                std::process::exit(1);
+            }
         }
 
         Command::Validate {
@@ -534,7 +533,7 @@ async fn main() -> Result<()> {
                             .map_or_else(|| "unknown".into(), |n| n.to_string()),
                         check.message
                     );
-                    failed |= !check.reachable || !check.found || !check.passphrase_ok;
+                    failed |= !check_passed(&check);
                 }
                 if failed {
                     return Err(anyhow::anyhow!("one or more Horizon checks failed"));
@@ -724,19 +723,13 @@ async fn main() -> Result<()> {
             // Validate with the config crate before touching the filesystem.
             AppConfig::parse(&raw, output).context("the generated config is not valid")?;
 
-            // #227: use create_new(true) to avoid TOCTOU race, unless --force
+            // #471: write the config exactly once. The content goes to a sibling
+            // temp file created with `create_new` and mode 0600 (it may hold a
+            // webhook secret), which is then renamed over the target. Without
+            // `--force` the rename must not clobber a file that appeared after
+            // the existence check above (#227), so we re-check and use a
+            // no-clobber rename where the platform supports it.
             write_config_file(output, &raw, force)?;
-
-            // Write to a sibling temp file and rename over the target so an
-            // interrupted write never leaves a truncated config. `fs::rename`
-            // replaces an existing file atomically on Unix and on Windows
-            // (via MoveFileEx with MOVEFILE_REPLACE_EXISTING).
-            let tmp = output.with_extension("toml.tmp");
-            fs::write(&tmp, raw).with_context(|| format!("failed to write '{}'", tmp.display()))?;
-            fs::rename(&tmp, output).with_context(|| {
-                let _ = fs::remove_file(&tmp);
-                format!("failed to write '{}'", output.display())
-            })?;
             println!(
                 "Wrote {}. Check it with: txwatch --config {} validate",
                 output.display(),
@@ -1018,46 +1011,57 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-/// Write the config file atomically:
-///  - Without `--force`: use `create_new(true)` so a file created between the
-///    existence check and the write is never silently overwritten (TOCTOU fix, #227).
-///  - With `--force`: truncate and overwrite.
-/// On Unix the file is created with 0600 permissions since it may hold a
-/// webhook secret.
+/// Write the config file atomically and exactly once (#471):
+///  - The content is written to a sibling `<output>.toml.tmp` created with
+///    `create_new(true)` and mode 0600 on Unix, so a partial write never leaves
+///    a truncated config and the file is never world-readable.
+///  - The temp file is then renamed over the target. Without `--force` the
+///    target must not exist (TOCTOU fix, #227); with `--force` it is replaced.
 fn write_config_file(path: &Path, content: &str, force: bool) -> Result<()> {
-    // Build the OpenOptions depending on mode.
-    let file = if force {
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-    } else {
-        OpenOptions::new().write(true).create_new(true).open(path)
-    }
-    .with_context(|| {
-        if force {
-            format!("failed to open '{}' for writing", path.display())
-        } else {
-            format!(
-                "'{}' already exists; pass --force to overwrite it",
-                path.display()
-            )
-        }
-    })?;
+    use std::io::Write;
 
-    // Set 0600 permissions on Unix before writing any content.
+    let tmp = path.with_extension("toml.tmp");
+    // Remove a stale temp file from a previous interrupted run; `create_new`
+    // below still protects against a concurrent writer.
+    let _ = fs::remove_file(&tmp);
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp)
+        .with_context(|| format!("failed to create '{}'", tmp.display()))?;
+
+    // Belt and braces: enforce 0600 even if the umask or platform ignored `mode`.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set permissions on '{}'", path.display()))?;
+            .with_context(|| format!("failed to set permissions on '{}'", tmp.display()))?;
     }
 
-    use std::io::Write;
-    let mut file = file;
     file.write_all(content.as_bytes())
-        .with_context(|| format!("failed to write '{}'", path.display()))?;
+        .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush '{}'", tmp.display()))?;
+    drop(file);
+
+    if !force && path.exists() {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow::anyhow!(
+            "'{}' already exists; pass --force to overwrite it",
+            path.display()
+        ));
+    }
+
+    fs::rename(&tmp, path).with_context(|| {
+        let _ = fs::remove_file(&tmp);
+        format!("failed to write '{}'", path.display())
+    })?;
     Ok(())
 }
 
@@ -1681,6 +1685,12 @@ struct HorizonCheck {
     passphrase_ok: bool,
 }
 
+/// Shared pass/fail rule for a Horizon check, used by both the text and JSON
+/// `validate` output (#473).
+fn check_passed(check: &HorizonCheck) -> bool {
+    check.reachable && check.found && check.passphrase_ok
+}
+
 async fn check_horizon_contract(
     client: &Client,
     contract: &txwatch_config::WatchedContract,
@@ -1741,31 +1751,145 @@ async fn check_horizon_contract(
         _ => true,
     };
 
-    // Horizon exposes Soroban contract activity through the same account-style
-    // transactions collection used by the poller. A 404 means the contract is
-    // not known on this network; a successful empty collection is still valid.
-    let found = client
-        .get(format!(
-            "{}/accounts/{}/transactions?limit=1",
-            base, contract.contract_id
-        ))
-        .send()
-        .await
-        .map(|response| response.status().is_success())
-        .unwrap_or(false);
+    // #472: Horizon's `/accounts/{id}` routes reject `C…` contract addresses
+    // with HTTP 400, so probe existence through Soroban RPC `getLedgerEntries`
+    // using the contract instance ledger key instead.
+    let rpc_url = contract
+        .network
+        .soroban_rpc_url()
+        .map(str::to_owned)
+        .or_else(|| contract.soroban_rpc_url_override.clone());
+    let Some(rpc_url) = rpc_url else {
+        return HorizonCheck {
+            network: contract.network.as_str().into(),
+            status: "unsupported",
+            latest_ledger,
+            reachable,
+            found: false,
+            message: format!(
+                "no Soroban RPC endpoint is known for {}; cannot verify contract existence",
+                contract.network
+            ),
+            passphrase_ok,
+        };
+    };
+
+    let ledger_key = contract_instance_ledger_key(&contract.contract_id);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLedgerEntries",
+        "params": { "keys": [ledger_key] },
+    });
+    let response = client.post(&rpc_url).json(&body).send().await;
+    let (found, status, message) = match response {
+        Ok(resp) if resp.status().is_success() => {
+            let json = resp.json::<serde_json::Value>().await.unwrap_or_default();
+            if let Some(error) = json.get("error") {
+                let detail = error
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown RPC error");
+                (
+                    false,
+                    "unsupported",
+                    format!("Soroban RPC {} rejected getLedgerEntries: {}", rpc_url, detail),
+                )
+            } else {
+                let entries = json
+                    .get("result")
+                    .and_then(|r| r.get("entries"))
+                    .and_then(|e| e.as_array());
+                let found = entries.map(|e| !e.is_empty()).unwrap_or(false);
+                if found {
+                    (
+                        true,
+                        "found",
+                        format!("{} exists on {}", contract.label, contract.network),
+                    )
+                } else {
+                    (
+                        false,
+                        "not found",
+                        format!(
+                            "{} not found on {}",
+                            contract.contract_id, contract.network
+                        ),
+                    )
+                }
+            }
+        }
+        Ok(resp) if resp.status() == StatusCode::BAD_REQUEST => {
+            // Horizon (or a proxy) answered instead of Soroban RPC and does not
+            // accept contract addresses — distinguish this from "not found".
+            let body = resp.text().await.unwrap_or_default();
+            (
+                false,
+                "unsupported",
+                format!(
+                    "endpoint {} does not support contract addresses (HTTP 400: {})",
+                    rpc_url,
+                    body.trim()
+                ),
+            )
+        }
+        Ok(resp) => (
+            false,
+            "unsupported",
+            format!(
+                "Soroban RPC {} returned HTTP {}",
+                rpc_url,
+                resp.status().as_u16()
+            ),
+        ),
+        Err(err) => (
+            false,
+            "unsupported",
+            format!("Soroban RPC {} is unreachable: {:#}", rpc_url, err),
+        ),
+    };
     HorizonCheck {
         network: contract.network.as_str().into(),
-        status: if found { "found" } else { "not found" },
+        status,
         latest_ledger,
         reachable,
         found,
-        message: if found {
-            format!("{} exists on {}", contract.label, contract.network)
-        } else {
-            format!("{} not found on {}", contract.contract_id, contract.network)
-        },
+        message,
         passphrase_ok,
     }
+}
+
+/// Build the base64 XDR `LedgerKey::ContractData` for a contract's instance
+/// entry, as expected by Soroban RPC `getLedgerEntries`.
+fn contract_instance_ledger_key(contract_id: &str) -> String {
+    use base64::Engine;
+    // LedgerKey::ContractData discriminant is 6; the contract instance is the
+    // ContractData entry with key `ScVal::LedgerKeyContractInstance` (type 20).
+    let mut bytes = Vec::new();
+    bytes.push(6u8); // LedgerKey::ContractData
+    bytes.push(0u8); // SCAddress::Contract
+    bytes.extend_from_slice(&strkey_to_raw(contract_id));
+    bytes.push(20u8); // ScVal::LedgerKeyContractInstance
+    bytes.push(1u8); // ContractDataDurability::Persistent
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decode a `C…` strkey contract address into its 32 raw bytes. Falls back to
+/// the raw bytes of the string if it is not a valid strkey.
+fn strkey_to_raw(contract_id: &str) -> [u8; 32] {
+    use base64::Engine;
+    let mut out = [0u8; 32];
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(contract_id) {
+        // 1 version byte + 32 payload bytes + 2 CRC bytes.
+        if decoded.len() == 35 {
+            out.copy_from_slice(&decoded[1..33]);
+            return out;
+        }
+    }
+    let bytes = contract_id.as_bytes();
+    let len = bytes.len().min(32);
+    out[..len].copy_from_slice(&bytes[..len]);
+    out
 }
 // ── Tracing initialisation ────────────────────────────────────────────────────
 
