@@ -354,3 +354,62 @@ webhook_url = "https://hooks.example.com/test"
         "expected the error to list configured labels, got: {stderr}"
     );
 }
+
+#[test]
+fn test_webhook_contract_conflicts_with_per_url_flags() {
+    let dir = env::temp_dir();
+    let cfg_path = dir.join("txwatch_test_webhook_contract_conflicts.toml");
+    let config = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "Vault"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/test"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+    fs::write(&cfg_path, config).unwrap();
+
+    let cases: [(&str, &[&str]); 4] = [
+        ("format", &["--format", "slack"]),
+        ("header", &["--header", "X-Env: staging"]),
+        ("routing-key", &["--routing-key", "ops"]),
+        ("horizon-url", &["--horizon-url", "https://horizon.example.com"]),
+    ];
+
+    for (flag, extra_args) in cases {
+        let mut args = vec![
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "test-webhook",
+            "--url",
+            "http://127.0.0.1:1/webhook",
+            "--contract",
+            "Vault",
+        ];
+        args.extend_from_slice(extra_args);
+
+        let output = txwatch_bin()
+            .args(&args)
+            .output()
+            .expect("failed to run txwatch");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "expected clap conflict error (exit code 2) for --contract with {flag}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cannot be used with") || stderr.contains("conflict"),
+            "expected a conflict error mentioning {flag}, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("contract"),
+            "expected the conflict error to mention --contract, got: {stderr}"
+        );
+    }
+}
