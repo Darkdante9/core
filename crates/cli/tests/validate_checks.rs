@@ -234,6 +234,48 @@ fn horizon_found_json() -> serde_json::Value {
     serde_json::json!({ "_embedded": { "records": [] } })
 }
 
+/// Horizon's real 400 body when a `C…` contract address is used on an
+/// `/accounts/{id}` route (see #4 / #472).
+fn horizon_c_address_400_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "https://stellar.org/horizon-errors/not_found",
+        "title": "Resource Missing",
+        "status": 404,
+        "detail": "The resource at the url requested was not found.  This usually occurs for one of two reasons:  The url requested is not valid, or no data in our database could be found with the parameters provided."
+    })
+}
+
+/// Soroban RPC `getLedgerEntries` response containing one contract instance.
+fn soroban_entry_found_json() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "entries": [
+                {
+                    "key": "AAAABgAAAAH/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                    "xdr": "AAAABgAAAAH/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                    "lastModifiedLedgerSeq": 100u64,
+                    "liveUntilLedgerSeq": 200u64
+                }
+            ],
+            "latestLedger": 100u64
+        }
+    })
+}
+
+/// Soroban RPC `getLedgerEntries` response with no matching entry.
+fn soroban_entry_missing_json() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "entries": [],
+            "latestLedger": 100u64
+        }
+    })
+}
+
 #[tokio::test]
 async fn check_horizon_passes_when_passphrase_matches() {
     let horizon = MockServer::start().await;
@@ -319,6 +361,277 @@ async fn check_horizon_fails_when_passphrase_mismatches() {
     assert!(
         stdout.contains("passphrase mismatch"),
         "expected passphrase mismatch message in: {stdout}"
+    );
+}
+
+// ── #472: contract existence via Soroban RPC / Horizon 400 handling ──────────
+
+#[tokio::test]
+async fn check_horizon_reports_endpoint_does_not_support_contracts_on_400() {
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(horizon_root_json(
+                "Test SDF Network ; September 2015",
+            )),
+        )
+        .mount(&horizon)
+        .await;
+    // Horizon rejects `C…` addresses on /accounts/{id}/transactions with 400.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/accounts/.*/transactions$"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(horizon_c_address_400_json()))
+        .mount(&horizon)
+        .await;
+
+    let config = write_config_custom_with_passphrase(
+        "horizon_c_400",
+        &horizon.uri(),
+        "Test SDF Network ; September 2015",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-horizon",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("endpoint does not support contracts"),
+        "expected 'endpoint does not support contracts' in: {stdout}"
+    );
+    assert!(
+        !stdout.to_lowercase().contains("not found"),
+        "must not report 'not found' for a 400: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn check_horizon_contract_found_via_soroban_rpc() {
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(horizon_root_json(
+                "Test SDF Network ; September 2015",
+            )),
+        )
+        .mount(&horizon)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(soroban_entry_found_json()))
+        .mount(&horizon)
+        .await;
+
+    let config = write_config_custom_with_passphrase(
+        "soroban_found",
+        &horizon.uri(),
+        "Test SDF Network ; September 2015",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-horizon",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert!(
+        output.status.success(),
+        "contract found via getLedgerEntries should pass; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn check_horizon_contract_not_found_via_soroban_rpc() {
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(horizon_root_json(
+                "Test SDF Network ; September 2015",
+            )),
+        )
+        .mount(&horizon)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(soroban_entry_missing_json()))
+        .mount(&horizon)
+        .await;
+
+    let config = write_config_custom_with_passphrase(
+        "soroban_missing",
+        &horizon.uri(),
+        "Test SDF Network ; September 2015",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-horizon",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing contract must fail; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_lowercase().contains("not found"),
+        "expected 'not found' in: {stdout}"
+    );
+}
+
+// ── #473: JSON output includes passphrase_ok ─────────────────────────────────
+
+#[tokio::test]
+async fn check_horizon_json_includes_passphrase_ok_and_fails_on_mismatch() {
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(horizon_root_json(
+                "Public Global Stellar Network ; September 2015",
+            )),
+        )
+        .mount(&horizon)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(soroban_entry_found_json()))
+        .mount(&horizon)
+        .await;
+
+    let config = write_config_custom_with_passphrase(
+        "json_passphrase_mismatch",
+        &horizon.uri(),
+        "Test SDF Network ; September 2015",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-horizon",
+            "--format",
+            "json",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "passphrase mismatch must fail in JSON mode; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON");
+    let checks = json
+        .get("horizon_checks")
+        .and_then(|v| v.as_array())
+        .expect("horizon_checks array present");
+    let first = checks.first().expect("at least one horizon check");
+    assert_eq!(
+        first.get("passphrase_ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "passphrase_ok should be false: {first}"
+    );
+}
+
+// ── #474: JSON runs all checks before exiting ────────────────────────────────
+
+#[tokio::test]
+async fn json_with_failing_webhook_still_reports_horizon_checks() {
+    let receiver = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&receiver)
+        .await;
+    Mock::given(method("OPTIONS"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&receiver)
+        .await;
+
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(horizon_root_json(
+                "Test SDF Network ; September 2015",
+            )),
+        )
+        .mount(&horizon)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(soroban_entry_found_json()))
+        .mount(&horizon)
+        .await;
+
+    let config = write_config_custom_with_passphrase(
+        "json_webhook_and_horizon",
+        &horizon.uri(),
+        "Test SDF Network ; September 2015",
+    );
+    // Point the webhook at the failing receiver.
+    let cfg_text = fs::read_to_string(&config).unwrap().replace(
+        "https://hooks.example.com/unused",
+        &format!("{}/hook", receiver.uri()),
+    );
+    fs::write(&config, cfg_text).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-webhooks",
+            "--check-horizon",
+            "--format",
+            "json",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "failing webhook must exit 1; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON");
+    assert!(
+        json.get("horizon_checks").is_some(),
+        "horizon_checks must be present even when webhook fails: {json}"
     );
 }
 
