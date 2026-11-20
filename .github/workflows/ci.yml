@@ -25,6 +25,12 @@ jobs:
           jq -S . /tmp/txwatch-config.schema.json > /tmp/txwatch-config.schema.sorted.json
           jq -S . docs/txwatch-config.schema.json > /tmp/txwatch-config.committed.sorted.json
           diff -u /tmp/txwatch-config.committed.sorted.json /tmp/txwatch-config.schema.sorted.json
+      - name: Regenerate and compare alert batch schema
+        run: |
+          cargo run --quiet -p txwatch -- schema --batch > /tmp/alert-batch.schema.json
+          jq -S . /tmp/alert-batch.schema.json > /tmp/alert-batch.schema.sorted.json
+          jq -S . docs/alert-batch.schema.json > /tmp/alert-batch.committed.sorted.json
+          diff -u /tmp/alert-batch.committed.sorted.json /tmp/alert-batch.schema.sorted.json
 
   # NOTE: like config-schema, this job should be a required status check.
   payload-schema:
